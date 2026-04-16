@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from torch.utils.data import Dataset
 from torchvision.datasets import CIFAR100
@@ -71,9 +71,10 @@ class CIFAR100SubsetByClass(Dataset):
 
 class FinalOpenSetNoisyDataset(Dataset):
     """
-    Final training dataset = clean known samples + generated open-set noisy samples.
+    Final training dataset for clean/closed/open noisy samples.
 
-    All returned training labels are in [0, num_known_classes - 1].
+    Backward compatible with the original open-set-only return format while exposing
+    richer metadata for mixed-noise workflows.
     """
 
     def __init__(self, samples: List[dict], include_metadata: bool = True):
@@ -89,13 +90,37 @@ class FinalOpenSetNoisyDataset(Dataset):
             return {
                 "image": s["image"],
                 "label": s["label"],
-                "is_open_set_noise": s["is_open_set_noise"],
                 "original_label": s["original_label"],
                 "source_index": s.get("source_index", -1),
+                "is_open_set_noise": s.get("is_open_set_noise", False),
+                "is_closed_set_noise": s.get("is_closed_set_noise", False),
+                "noise_type": s.get("noise_type", "open" if s.get("is_open_set_noise", False) else "clean"),
+                "flip_rate": s.get("flip_rate", None),
                 "max_prob": s.get("max_prob", None),
                 "entropy": s.get("entropy", None),
             }
         return s["image"], s["label"]
+
+
+def _resolve_target_noisy_count(
+    n_known: int,
+    available_noisy: int,
+    open_set_noise_ratio: float,
+    ratio_mode: str,
+) -> int:
+    if ratio_mode not in {"fraction_total", "relative_clean"}:
+        raise ValueError("ratio_mode must be one of {'fraction_total', 'relative_clean'}")
+
+    if ratio_mode == "fraction_total":
+        if not (0.0 <= open_set_noise_ratio < 1.0):
+            raise ValueError("fraction_total ratio must be in [0, 1)")
+        target_noisy = int(round(open_set_noise_ratio * n_known / (1.0 - open_set_noise_ratio)))
+    else:
+        if open_set_noise_ratio < 0:
+            raise ValueError("relative_clean ratio must be >= 0")
+        target_noisy = int(round(open_set_noise_ratio * n_known))
+
+    return min(target_noisy, available_noisy)
 
 
 def build_final_open_set_dataset(
@@ -111,22 +136,13 @@ def build_final_open_set_dataset(
       - fraction_total: ratio = M / (N_clean + M)
       - relative_clean: ratio = M / N_clean
     """
-    if ratio_mode not in {"fraction_total", "relative_clean"}:
-        raise ValueError("ratio_mode must be one of {'fraction_total', 'relative_clean'}")
-
     n_clean = len(clean_known_dataset)
-    available_noisy = len(unknown_assignments)
-
-    if ratio_mode == "fraction_total":
-        if not (0.0 <= open_set_noise_ratio < 1.0):
-            raise ValueError("fraction_total ratio must be in [0, 1)")
-        target_noisy = int(round(open_set_noise_ratio * n_clean / (1.0 - open_set_noise_ratio)))
-    else:
-        if open_set_noise_ratio < 0:
-            raise ValueError("relative_clean ratio must be >= 0")
-        target_noisy = int(round(open_set_noise_ratio * n_clean))
-
-    target_noisy = min(target_noisy, available_noisy)
+    target_noisy = _resolve_target_noisy_count(
+        n_known=n_clean,
+        available_noisy=len(unknown_assignments),
+        open_set_noise_ratio=open_set_noise_ratio,
+        ratio_mode=ratio_mode,
+    )
     selected_unknown = unknown_assignments[:target_noisy]
 
     final_samples: List[dict] = []
@@ -138,6 +154,8 @@ def build_final_open_set_dataset(
                 "image": s["image"],
                 "label": int(s["label"]),
                 "is_open_set_noise": False,
+                "is_closed_set_noise": False,
+                "noise_type": "clean",
                 "original_label": int(s["original_label"]),
                 "source_index": int(s["index"]),
             }
@@ -149,8 +167,71 @@ def build_final_open_set_dataset(
                 "image": s["image"],
                 "label": int(s["noisy_label"]),
                 "is_open_set_noise": True,
+                "is_closed_set_noise": False,
+                "noise_type": "open",
                 "original_label": int(s["original_unknown_class"]),
                 "source_index": int(s["index"]),
+                "max_prob": float(s["max_prob"]),
+                "entropy": float(s["entropy"]),
+            }
+        )
+
+    return FinalOpenSetNoisyDataset(samples=final_samples, include_metadata=True)
+
+
+def build_final_mixed_noise_dataset(
+    closed_known_samples: List[dict],
+    unknown_assignments: List[dict],
+    open_set_noise_ratio: float,
+    ratio_mode: str = "fraction_total",
+) -> FinalOpenSetNoisyDataset:
+    """
+    Build final mixed-noise dataset:
+      - known samples (clean and/or closed-set noisy) from closed_known_samples
+      - open-set noisy unknown samples from unknown_assignments
+
+    ratio_mode:
+      - fraction_total: ratio = M_open / (N_known + M_open)
+      - relative_clean: ratio = M_open / N_known
+    """
+    n_known = len(closed_known_samples)
+    target_noisy = _resolve_target_noisy_count(
+        n_known=n_known,
+        available_noisy=len(unknown_assignments),
+        open_set_noise_ratio=open_set_noise_ratio,
+        ratio_mode=ratio_mode,
+    )
+    selected_unknown = unknown_assignments[:target_noisy]
+
+    final_samples: List[dict] = []
+
+    for s in closed_known_samples:
+        final_samples.append(
+            {
+                "image": s["image"],
+                "label": int(s["label"]),
+                "original_label": int(s["original_label"]),
+                "source_index": int(s.get("source_index", s.get("index", -1))),
+                "is_open_set_noise": False,
+                "is_closed_set_noise": bool(s.get("is_closed_set_noise", False)),
+                "noise_type": "closed" if s.get("is_closed_set_noise", False) else "clean",
+                "flip_rate": None if s.get("flip_rate") is None else float(s["flip_rate"]),
+                "max_prob": None if s.get("max_prob") is None else float(s["max_prob"]),
+                "entropy": None if s.get("entropy") is None else float(s["entropy"]),
+            }
+        )
+
+    for s in selected_unknown:
+        final_samples.append(
+            {
+                "image": s["image"],
+                "label": int(s["noisy_label"]),
+                "original_label": int(s["original_unknown_class"]),
+                "source_index": int(s["index"]),
+                "is_open_set_noise": True,
+                "is_closed_set_noise": False,
+                "noise_type": "open",
+                "flip_rate": None,
                 "max_prob": float(s["max_prob"]),
                 "entropy": float(s["entropy"]),
             }
