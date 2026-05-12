@@ -1,4 +1,10 @@
-"""Generate mixed closed-set + open-set instance-dependent noisy training data."""
+"""Generate mixed closed-set + open-set instance-dependent noisy training data.
+
+The default workflow uses a full clean CIFAR-100 reference classifier with 100
+output logits. The known/unknown split is loaded from an explicit split-info
+JSON file and is used only to construct probabilities and final noisy labels in
+the remapped known label space [0, K-1].
+"""
 
 from __future__ import annotations
 
@@ -7,7 +13,7 @@ import csv
 import json
 import os
 from collections import Counter
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -25,6 +31,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_root", type=str, default="./data")
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--ref_ckpt", type=str, required=True)
+    parser.add_argument(
+        "--split_info_path",
+        type=str,
+        default=None,
+        help=(
+            "JSON file containing known_classes, unknown_classes, and known_remap. "
+            "Required for the new full-CIFAR reference workflow unless "
+            "--allow_checkpoint_split is set for backward compatibility."
+        ),
+    )
+    parser.add_argument(
+        "--allow_checkpoint_split",
+        action="store_true",
+        help="Backward compatibility: load known/unknown split metadata from the checkpoint if --split_info_path is omitted.",
+    )
+    parser.add_argument(
+        "--ref_model_num_classes",
+        type=int,
+        default=100,
+        help="Reference classifier output dimension. Default is 100 for full clean CIFAR-100 checkpoints; set 0 to infer from the checkpoint.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num_unknown_classes", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -43,6 +70,128 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
+
+
+def _load_json(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _coerce_split(split: dict) -> Tuple[List[int], List[int], Dict[int, int]]:
+    """Load and validate known/unknown split metadata independent of the model head."""
+    missing = [k for k in ("known_classes", "unknown_classes", "known_remap") if k not in split]
+    if missing:
+        raise KeyError(f"Split info is missing required key(s): {missing}")
+
+    known_classes = [int(c) for c in split["known_classes"]]
+    unknown_classes = [int(c) for c in split["unknown_classes"]]
+    known_remap = {int(k): int(v) for k, v in split["known_remap"].items()}
+
+    if len(set(known_classes)) != len(known_classes):
+        raise ValueError("known_classes contains duplicates")
+    if len(set(unknown_classes)) != len(unknown_classes):
+        raise ValueError("unknown_classes contains duplicates")
+    if set(known_classes) & set(unknown_classes):
+        raise ValueError("known_classes and unknown_classes must be disjoint")
+    if set(known_remap.keys()) != set(known_classes):
+        raise ValueError("known_remap keys must exactly match known_classes")
+
+    expected_remapped = set(range(len(known_classes)))
+    actual_remapped = set(known_remap.values())
+    if actual_remapped != expected_remapped:
+        raise ValueError(
+            f"known_remap values must be contiguous labels {sorted(expected_remapped)}, "
+            f"got {sorted(actual_remapped)}"
+        )
+    if min(known_classes + unknown_classes) < 0 or max(known_classes + unknown_classes) >= 100:
+        raise ValueError("CIFAR-100 class ids in split info must be in [0, 99]")
+
+    return known_classes, unknown_classes, known_remap
+
+
+def load_split_info(args: argparse.Namespace, ckpt: dict) -> Tuple[List[int], List[int], Dict[int, int]]:
+    """
+    Load noise-generation split metadata from an explicit split-info file.
+
+    Checkpoint split loading is intentionally opt-in so a full-CIFAR reference
+    checkpoint does not define the known label space by accident.
+    """
+    if args.split_info_path is not None:
+        return _coerce_split(_load_json(args.split_info_path))
+
+    if args.allow_checkpoint_split:
+        split = {
+            "known_classes": ckpt.get("known_classes"),
+            "unknown_classes": ckpt.get("unknown_classes"),
+            "known_remap": ckpt.get("known_remap"),
+        }
+        if all(v is not None for v in split.values()):
+            return _coerce_split(split)
+        return split_known_unknown_classes(
+            num_total_classes=100,
+            num_unknown_classes=args.num_unknown_classes,
+            seed=args.seed,
+            fixed_known_classes=None,
+        )
+
+    raise ValueError(
+        "--split_info_path is required for generate_mixed_noise.py. "
+        "Pass a JSON file with known_classes, unknown_classes, and known_remap. "
+        "For old known-only checkpoint workflows, pass --allow_checkpoint_split explicitly."
+    )
+
+
+def known_classes_by_remapped_label(known_classes: List[int], known_remap: Dict[int, int]) -> List[int]:
+    """Return original CIFAR-100 class ids ordered by remapped known label [0, K-1]."""
+    ordered = [None] * len(known_classes)
+    for original_class in known_classes:
+        ordered[known_remap[int(original_class)]] = int(original_class)
+    if any(c is None for c in ordered):
+        raise ValueError("known_remap does not cover every remapped known label")
+    return [int(c) for c in ordered]
+
+
+def infer_num_ref_classes(ckpt: dict, fallback: int) -> int:
+    """Infer checkpoint classifier outputs when the caller requests --ref_model_num_classes 0."""
+    if fallback > 0:
+        return int(fallback)
+    if "num_ref_classes" in ckpt:
+        return int(ckpt["num_ref_classes"])
+    state = ckpt["model_state"]
+    for key in ("backbone.fc.weight", "fc.weight"):
+        if key in state:
+            return int(state[key].shape[0])
+    if "num_known_classes" in ckpt:
+        return int(ckpt["num_known_classes"])
+    raise KeyError("Could not infer reference classifier output dimension from checkpoint")
+
+
+def known_space_probs(
+    logits: torch.Tensor,
+    known_class_index: torch.Tensor,
+    num_ref_classes: int,
+    num_known_classes: int,
+    temperature: float,
+) -> torch.Tensor:
+    """Return probabilities over remapped known labels [0, K-1]."""
+    if num_ref_classes == 100:
+        known_logits = logits.index_select(dim=1, index=known_class_index)
+        return torch.softmax(known_logits / temperature, dim=1)
+
+    if num_ref_classes == num_known_classes:
+        # Backward-compatible path for old checkpoints trained only on known labels.
+        return torch.softmax(logits / temperature, dim=1)
+
+    raise ValueError(
+        f"Expected reference classifier to have either 100 full-CIFAR outputs or "
+        f"{num_known_classes} known-only outputs, got {num_ref_classes}"
+    )
+
+
+def validate_final_labels(samples: List[dict], num_known_classes: int) -> None:
+    bad = [s for s in samples if int(s["label"]) < 0 or int(s["label"]) >= num_known_classes]
+    if bad:
+        raise ValueError(f"Found {len(bad)} final labels outside [0, {num_known_classes - 1}]")
 
 
 def entropy_of_probs(probs: torch.Tensor) -> torch.Tensor:
@@ -70,6 +219,9 @@ def sample_truncated_flip_rate(mean: float, size: int, std: float = 0.1) -> np.n
 def generate_closed_set_samples(
     model: torch.nn.Module,
     known_loader: DataLoader,
+    known_class_index: torch.Tensor,
+    num_ref_classes: int,
+    num_known_classes: int,
     temperature: float,
     closed_set_noise_rate: float,
     device: torch.device,
@@ -84,7 +236,13 @@ def generate_closed_set_samples(
             sample_indices = batch["index"]
 
             logits = model(images)
-            probs = torch.softmax(logits / temperature, dim=1)
+            probs = known_space_probs(
+                logits=logits,
+                known_class_index=known_class_index,
+                num_ref_classes=num_ref_classes,
+                num_known_classes=num_known_classes,
+                temperature=temperature,
+            )
             ents = entropy_of_probs(probs)
 
             q = sample_truncated_flip_rate(mean=closed_set_noise_rate, size=images.shape[0], std=0.1)
@@ -137,6 +295,9 @@ def generate_closed_set_samples(
 def generate_open_set_assignments(
     model: torch.nn.Module,
     unknown_loader: DataLoader,
+    known_class_index: torch.Tensor,
+    num_ref_classes: int,
+    num_known_classes: int,
     temperature: float,
     device: torch.device,
 ) -> List[dict]:
@@ -149,7 +310,13 @@ def generate_open_set_assignments(
             sample_indices = batch["index"]
 
             logits = model(images)
-            probs = torch.softmax(logits / temperature, dim=1)
+            probs = known_space_probs(
+                logits=logits,
+                known_class_index=known_class_index,
+                num_ref_classes=num_ref_classes,
+                num_known_classes=num_known_classes,
+                temperature=temperature,
+            )
             max_probs, _ = probs.max(dim=1)
             ents = entropy_of_probs(probs)
             sampled_labels = torch.multinomial(probs, num_samples=1).squeeze(1)
@@ -177,18 +344,10 @@ def main() -> None:
     ensure_dir(args.output_dir)
 
     ckpt = torch.load(args.ref_ckpt, map_location="cpu")
-    known_classes = ckpt["known_classes"]
-    unknown_classes = ckpt["unknown_classes"]
-    known_remap = {int(k): int(v) for k, v in ckpt["known_remap"].items()}
-    num_known = int(ckpt["num_known_classes"])
-
-    if known_classes is None or unknown_classes is None:
-        known_classes, unknown_classes, known_remap = split_known_unknown_classes(
-            num_total_classes=100,
-            num_unknown_classes=args.num_unknown_classes,
-            seed=args.seed,
-            fixed_known_classes=None,
-        )
+    known_classes, unknown_classes, known_remap = load_split_info(args, ckpt)
+    num_known = len(known_classes)
+    num_ref_classes = infer_num_ref_classes(ckpt, fallback=args.ref_model_num_classes)
+    ordered_known_classes = known_classes_by_remapped_label(known_classes, known_remap)
 
     tfm = transforms.Compose(
         [
@@ -217,13 +376,17 @@ def main() -> None:
     )
 
     device = torch.device(args.device)
-    model = CIFARResNet18(num_classes=num_known).to(device)
+    known_class_index = torch.tensor(ordered_known_classes, dtype=torch.long, device=device)
+    model = CIFARResNet18(num_classes=num_ref_classes).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
     closed_known_samples = generate_closed_set_samples(
         model=model,
         known_loader=known_loader,
+        known_class_index=known_class_index,
+        num_ref_classes=num_ref_classes,
+        num_known_classes=num_known,
         temperature=args.temperature,
         closed_set_noise_rate=args.closed_set_noise_rate,
         device=device,
@@ -232,6 +395,9 @@ def main() -> None:
     all_unknown_assignments = generate_open_set_assignments(
         model=model,
         unknown_loader=unknown_loader,
+        known_class_index=known_class_index,
+        num_ref_classes=num_ref_classes,
+        num_known_classes=num_known,
         temperature=args.temperature,
         device=device,
     )
@@ -248,6 +414,7 @@ def main() -> None:
         open_set_noise_ratio=args.open_set_noise_ratio,
         ratio_mode=args.ratio_mode,
     )
+    validate_final_labels(final_ds.samples, num_known)
 
     n_known = len(closed_known_samples)
     n_closed_flipped = sum(1 for s in closed_known_samples if s["is_closed_set_noise"])
@@ -273,6 +440,9 @@ def main() -> None:
     }
 
     print("==== Mixed Noise Stats ====")
+    print(f"Reference output classes: {num_ref_classes}")
+    print(f"Known classes ({len(known_classes)}): {known_classes}")
+    print(f"Unknown classes ({len(unknown_classes)}): {unknown_classes}")
     print(f"Known clean samples: {n_known_clean}")
     print(f"Known closed-set flipped samples: {n_closed_flipped}")
     print(f"Empirical closed-set flip ratio: {closed_ratio:.6f}")
@@ -291,12 +461,19 @@ def main() -> None:
             "known_classes": known_classes,
             "unknown_classes": unknown_classes,
             "known_remap": known_remap,
+            "num_known_classes": num_known,
+            "num_unknown_classes": len(unknown_classes),
         },
     )
 
     save_json(
         os.path.join(args.output_dir, "mixed_noise_stats.json"),
         {
+            "reference_checkpoint": args.ref_ckpt,
+            "reference_output_classes": num_ref_classes,
+            "split_info_path": args.split_info_path,
+            "num_known_classes": num_known,
+            "num_unknown_classes": len(unknown_classes),
             "num_known_samples": n_known,
             "num_known_clean_samples": n_known_clean,
             "num_known_closed_set_flipped_samples": n_closed_flipped,
