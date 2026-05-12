@@ -25,6 +25,48 @@ from model import CIFARResNet18
 from utils import ensure_dir, load_known_classes, save_json, set_seed, split_known_unknown_classes
 
 
+BooleanOptionalAction = getattr(argparse, "BooleanOptionalAction", None)
+
+if BooleanOptionalAction is None:
+    class BooleanOptionalAction(argparse.Action):
+        """Backport argparse.BooleanOptionalAction for Python < 3.9."""
+
+        def __init__(
+            self,
+            option_strings,
+            dest,
+            default=None,
+            type=None,
+            choices=None,
+            required=False,
+            help=None,
+            metavar=None,
+        ):
+            boolean_option_strings = []
+            for option_string in option_strings:
+                boolean_option_strings.append(option_string)
+                if option_string.startswith("--"):
+                    boolean_option_strings.append("--no-" + option_string[2:])
+
+            super().__init__(
+                option_strings=boolean_option_strings,
+                dest=dest,
+                nargs=0,
+                default=default,
+                type=type,
+                choices=choices,
+                required=required,
+                help=help,
+                metavar=metavar,
+            )
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            setattr(namespace, self.dest, not (option_string or "").startswith("--no-"))
+
+        def format_usage(self):
+            return " | ".join(self.option_strings)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train clean CIFAR-100 reference model")
     parser.add_argument("--data_root", type=str, default="./data")
@@ -34,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_unknown_classes", type=int, default=20)
     parser.add_argument(
         "--ref_train_full_dataset",
-        action=argparse.BooleanOptionalAction,
+        action=BooleanOptionalAction,
         default=True,
         help=(
             "Train the reference classifier on all 100 CIFAR-100 classes. "
