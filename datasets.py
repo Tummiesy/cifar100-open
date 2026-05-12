@@ -22,6 +22,25 @@ class UnknownSample:
     original_unknown_label: int
 
 
+class CIFAR100WithIndex(Dataset):
+    """Full CIFAR-100 dataset wrapper returning dict samples and source indices."""
+
+    def __init__(self, base_dataset: CIFAR100):
+        self.base = base_dataset
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int):
+        image, label = self.base[idx]
+        return {
+            "image": image,
+            "label": int(label),
+            "original_label": int(label),
+            "index": int(idx),
+        }
+
+
 class CIFAR100SubsetByClass(Dataset):
     """
     CIFAR-100 subset by class with optional label remapping.
@@ -71,7 +90,7 @@ class CIFAR100SubsetByClass(Dataset):
 
 class FinalOpenSetNoisyDataset(Dataset):
     """
-    Final training dataset for clean/closed/open noisy samples.
+    Final training dataset for clean/close/open noisy samples.
 
     Backward compatible with the original open-set-only return format while exposing
     richer metadata for mixed-noise workflows.
@@ -93,9 +112,16 @@ class FinalOpenSetNoisyDataset(Dataset):
                 "original_label": s["original_label"],
                 "source_index": s.get("source_index", -1),
                 "is_open_set_noise": s.get("is_open_set_noise", False),
-                "is_closed_set_noise": s.get("is_closed_set_noise", False),
+                "is_close_set_noise": s.get(
+                    "is_close_set_noise", s.get("is_closed_set_noise", False)
+                ),
+                "is_closed_set_noise": s.get(
+                    "is_closed_set_noise", s.get("is_close_set_noise", False)
+                ),
                 "noise_type": s.get("noise_type", "open" if s.get("is_open_set_noise", False) else "clean"),
                 "flip_rate": s.get("flip_rate", None),
+                "true_class_prob": s.get("true_class_prob", None),
+                "margin": s.get("margin", None),
                 "max_prob": s.get("max_prob", None),
                 "entropy": s.get("entropy", None),
             }
@@ -154,6 +180,7 @@ def build_final_open_set_dataset(
                 "image": s["image"],
                 "label": int(s["label"]),
                 "is_open_set_noise": False,
+                "is_close_set_noise": False,
                 "is_closed_set_noise": False,
                 "noise_type": "clean",
                 "original_label": int(s["original_label"]),
@@ -162,19 +189,94 @@ def build_final_open_set_dataset(
         )
 
     for s in selected_unknown:
-        final_samples.append(
-            {
-                "image": s["image"],
-                "label": int(s["noisy_label"]),
-                "is_open_set_noise": True,
-                "is_closed_set_noise": False,
-                "noise_type": "open",
-                "original_label": int(s["original_unknown_class"]),
-                "source_index": int(s["index"]),
-                "max_prob": float(s["max_prob"]),
-                "entropy": float(s["entropy"]),
-            }
-        )
+        final_samples.append(_format_open_sample(s))
+
+    return FinalOpenSetNoisyDataset(samples=final_samples, include_metadata=True)
+
+
+def _format_known_sample(s: dict) -> dict:
+    is_close = bool(s.get("is_close_set_noise", s.get("is_closed_set_noise", False)))
+    return {
+        "image": s["image"],
+        "label": int(s["label"]),
+        "original_label": int(s["original_label"]),
+        "source_index": int(s.get("source_index", s.get("index", -1))),
+        "is_open_set_noise": False,
+        "is_close_set_noise": is_close,
+        "is_closed_set_noise": is_close,
+        "noise_type": "closed" if is_close else "clean",
+        "flip_rate": None if s.get("flip_rate") is None else float(s["flip_rate"]),
+        "true_class_prob": None if s.get("true_class_prob") is None else float(s["true_class_prob"]),
+        "margin": None if s.get("margin") is None else float(s["margin"]),
+        "max_prob": None if s.get("max_prob") is None else float(s["max_prob"]),
+        "entropy": None if s.get("entropy") is None else float(s["entropy"]),
+    }
+
+
+def _format_open_sample(s: dict) -> dict:
+    return {
+        "image": s["image"],
+        "label": int(s["noisy_label"]),
+        "original_label": int(s["original_unknown_class"]),
+        "source_index": int(s["index"]),
+        "is_open_set_noise": True,
+        "is_close_set_noise": False,
+        "is_closed_set_noise": False,
+        "noise_type": "open",
+        "flip_rate": None,
+        "true_class_prob": None if s.get("true_class_prob") is None else float(s["true_class_prob"]),
+        "margin": None if s.get("margin") is None else float(s["margin"]),
+        "max_prob": float(s["max_prob"]),
+        "entropy": float(s["entropy"]),
+    }
+
+
+def build_final_clean_close_open_dataset(
+    known_dataset: CIFAR100SubsetByClass,
+    close_set_assignments: List[dict],
+    unknown_assignments: List[dict],
+    open_set_noise_ratio: float,
+    ratio_mode: str = "fraction_total",
+) -> FinalOpenSetNoisyDataset:
+    """
+    Build D_train = D_clean ∪ D_csn ∪ D_osn.
+
+    Known samples selected for close-set corruption are relabeled to another known
+    remapped label; all other known samples remain clean. Open-set unknown samples
+    are clipped by ``open_set_noise_ratio`` and are assigned remapped known labels.
+    """
+    selected_close_by_index = {int(s["source_index"]): s for s in close_set_assignments}
+
+    target_open = _resolve_target_noisy_count(
+        n_known=len(known_dataset),
+        available_noisy=len(unknown_assignments),
+        open_set_noise_ratio=open_set_noise_ratio,
+        ratio_mode=ratio_mode,
+    )
+    selected_unknown = unknown_assignments[:target_open]
+
+    final_samples: List[dict] = []
+
+    for i in range(len(known_dataset)):
+        clean = known_dataset[i]
+        source_index = int(clean["index"])
+        if source_index in selected_close_by_index:
+            final_samples.append(_format_known_sample(selected_close_by_index[source_index]))
+        else:
+            final_samples.append(
+                _format_known_sample(
+                    {
+                        "image": clean["image"],
+                        "label": int(clean["label"]),
+                        "original_label": int(clean["original_label"]),
+                        "source_index": source_index,
+                        "is_close_set_noise": False,
+                    }
+                )
+            )
+
+    for s in selected_unknown:
+        final_samples.append(_format_open_sample(s))
 
     return FinalOpenSetNoisyDataset(samples=final_samples, include_metadata=True)
 
@@ -206,35 +308,9 @@ def build_final_mixed_noise_dataset(
     final_samples: List[dict] = []
 
     for s in closed_known_samples:
-        final_samples.append(
-            {
-                "image": s["image"],
-                "label": int(s["label"]),
-                "original_label": int(s["original_label"]),
-                "source_index": int(s.get("source_index", s.get("index", -1))),
-                "is_open_set_noise": False,
-                "is_closed_set_noise": bool(s.get("is_closed_set_noise", False)),
-                "noise_type": "closed" if s.get("is_closed_set_noise", False) else "clean",
-                "flip_rate": None if s.get("flip_rate") is None else float(s["flip_rate"]),
-                "max_prob": None if s.get("max_prob") is None else float(s["max_prob"]),
-                "entropy": None if s.get("entropy") is None else float(s["entropy"]),
-            }
-        )
+        final_samples.append(_format_known_sample(s))
 
     for s in selected_unknown:
-        final_samples.append(
-            {
-                "image": s["image"],
-                "label": int(s["noisy_label"]),
-                "original_label": int(s["original_unknown_class"]),
-                "source_index": int(s["index"]),
-                "is_open_set_noise": True,
-                "is_closed_set_noise": False,
-                "noise_type": "open",
-                "flip_rate": None,
-                "max_prob": float(s["max_prob"]),
-                "entropy": float(s["entropy"]),
-            }
-        )
+        final_samples.append(_format_open_sample(s))
 
     return FinalOpenSetNoisyDataset(samples=final_samples, include_metadata=True)
