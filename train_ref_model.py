@@ -1,4 +1,11 @@
-"""Train clean reference model on known CIFAR-100 classes only."""
+"""Train a clean CIFAR-100 reference model for instance-dependent noise generation.
+
+By default the reference classifier is trained on the full clean CIFAR-100 training
+set with all 100 classes. A known/unknown split is still saved so later scripts can
+restrict generated noisy labels to the 80-class known label space. For legacy
+experiments, pass ``--no-ref_train_full_dataset`` to train the reference model on
+known classes only.
+"""
 
 from __future__ import annotations
 
@@ -13,18 +20,27 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.datasets import CIFAR100
 
-from datasets import CIFAR100SubsetByClass
+from datasets import CIFAR100SubsetByClass, CIFAR100WithIndex
 from model import CIFARResNet18
 from utils import ensure_dir, load_known_classes, save_json, set_seed, split_known_unknown_classes
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train reference model on known CIFAR-100 classes")
+    parser = argparse.ArgumentParser(description="Train clean CIFAR-100 reference model")
     parser.add_argument("--data_root", type=str, default="./data")
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--known_classes_file", type=str, default=None)
     parser.add_argument("--num_unknown_classes", type=int, default=20)
+    parser.add_argument(
+        "--ref_train_full_dataset",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Train the reference classifier on all 100 CIFAR-100 classes. "
+            "Use --no-ref_train_full_dataset for legacy known-only training."
+        ),
+    )
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=0.1)
@@ -34,7 +50,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def make_loaders(args: argparse.Namespace, known_classes, known_remap) -> Tuple[DataLoader, DataLoader, int]:
+def make_loaders(
+    args: argparse.Namespace,
+    known_classes,
+    known_remap,
+) -> Tuple[DataLoader, DataLoader, int]:
     train_tfm = transforms.Compose(
         [
             transforms.RandomCrop(32, padding=4),
@@ -53,8 +73,14 @@ def make_loaders(args: argparse.Namespace, known_classes, known_remap) -> Tuple[
     train_base = CIFAR100(root=args.data_root, train=True, download=True, transform=train_tfm)
     test_base = CIFAR100(root=args.data_root, train=False, download=True, transform=test_tfm)
 
-    train_ds = CIFAR100SubsetByClass(train_base, known_classes, label_remap=known_remap)
-    test_ds = CIFAR100SubsetByClass(test_base, known_classes, label_remap=known_remap)
+    if args.ref_train_full_dataset:
+        train_ds = CIFAR100WithIndex(train_base)
+        test_ds = CIFAR100WithIndex(test_base)
+        num_ref_classes = 100
+    else:
+        train_ds = CIFAR100SubsetByClass(train_base, known_classes, label_remap=known_remap)
+        test_ds = CIFAR100SubsetByClass(test_base, known_classes, label_remap=known_remap)
+        num_ref_classes = len(known_classes)
 
     train_loader = DataLoader(
         train_ds,
@@ -70,7 +96,7 @@ def make_loaders(args: argparse.Namespace, known_classes, known_remap) -> Tuple[
         num_workers=args.num_workers,
         pin_memory=True,
     )
-    return train_loader, test_loader, len(known_classes)
+    return train_loader, test_loader, num_ref_classes
 
 
 def evaluate(model, loader, criterion, device):
@@ -106,23 +132,27 @@ def main() -> None:
         fixed_known_classes=fixed_known,
     )
 
-    save_json(
-        os.path.join(args.output_dir, "split_info.json"),
-        {
-            "known_classes": known_classes,
-            "unknown_classes": unknown_classes,
-            "known_remap": known_remap,
-            "seed": args.seed,
-            "num_unknown_classes": args.num_unknown_classes,
-        },
-    )
+    split_payload = {
+        "known_classes": known_classes,
+        "unknown_classes": unknown_classes,
+        "known_remap": known_remap,
+        "seed": args.seed,
+        "num_unknown_classes": args.num_unknown_classes,
+        "num_total_classes": 100,
+        "num_known_classes": len(known_classes),
+        "ref_train_full_dataset": bool(args.ref_train_full_dataset),
+        "num_ref_classes": 100 if args.ref_train_full_dataset else len(known_classes),
+    }
+    save_json(os.path.join(args.output_dir, "split_info.json"), split_payload)
 
-    train_loader, test_loader, num_known = make_loaders(args, known_classes, known_remap)
+    train_loader, test_loader, num_ref_classes = make_loaders(args, known_classes, known_remap)
     print(f"Known classes: {len(known_classes)}, unknown classes: {len(unknown_classes)}")
-    print(f"Train known samples: {len(train_loader.dataset)}, Test known samples: {len(test_loader.dataset)}")
+    print(f"Reference training mode: {'full CIFAR-100' if args.ref_train_full_dataset else 'known-only'}")
+    print(f"Reference classifier output classes: {num_ref_classes}")
+    print(f"Train samples: {len(train_loader.dataset)}, Test samples: {len(test_loader.dataset)}")
 
     device = torch.device(args.device)
-    model = CIFARResNet18(num_classes=num_known).to(device)
+    model = CIFARResNet18(num_classes=num_ref_classes).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(
         model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay
@@ -169,19 +199,41 @@ def main() -> None:
             torch.save(
                 {
                     "model_state": model.state_dict(),
+                    "epoch": epoch,
+                    "best_acc": best_acc,
                     "known_classes": known_classes,
                     "unknown_classes": unknown_classes,
                     "known_remap": known_remap,
-                    "num_known_classes": num_known,
+                    "num_known_classes": len(known_classes),
+                    "num_unknown_classes": args.num_unknown_classes,
+                    "num_total_classes": 100,
+                    "num_ref_classes": num_ref_classes,
+                    "ref_train_full_dataset": bool(args.ref_train_full_dataset),
                     "seed": args.seed,
-                    "best_val_acc": best_acc,
-                    "args": vars(args),
                 },
                 ckpt_path,
             )
+            print(f"Saved best checkpoint to {ckpt_path} (val_acc={best_acc:.4f})")
 
-    print(f"Best validation accuracy: {best_acc:.4f}")
-    print(f"Saved checkpoint to: {os.path.join(args.output_dir, 'reference_model_best.pth')}")
+    final_path = os.path.join(args.output_dir, "reference_model_last.pth")
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "epoch": args.epochs,
+            "best_acc": best_acc,
+            "known_classes": known_classes,
+            "unknown_classes": unknown_classes,
+            "known_remap": known_remap,
+            "num_known_classes": len(known_classes),
+            "num_unknown_classes": args.num_unknown_classes,
+            "num_total_classes": 100,
+            "num_ref_classes": num_ref_classes,
+            "ref_train_full_dataset": bool(args.ref_train_full_dataset),
+            "seed": args.seed,
+        },
+        final_path,
+    )
+    print(f"Saved last checkpoint to {final_path}")
 
 
 if __name__ == "__main__":
